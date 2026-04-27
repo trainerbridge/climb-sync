@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.claude/
+
+# Build artifacts (binaries are distributed via GitHub Releases, not committed)
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test/cache
+.pytest_cache/
