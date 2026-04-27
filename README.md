@@ -29,7 +29,7 @@ trainer, so the Climb moves with the terrain while ERG keeps the watts steady.
 1. Download the latest `climb-sync-vX.Y.Z.zip` from the
    [Releases page](https://github.com/trainerbridge/climb-sync/releases/latest)
    and unzip it. You'll get `climb-sync.exe`, `README.txt`, and `LICENSE`.
-2. Double-click it. A tray icon appears next to the clock.
+2. Double-click it. A tray icon appears next to the clock (you may need to click `^` to see it).
    - Red: not connected
    - Yellow: partially connected (one of Kickr or Sauce4Zwift)
    - Green: live — Climb is tracking grade
