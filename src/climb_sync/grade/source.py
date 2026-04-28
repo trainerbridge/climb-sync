@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 S4Z_URL = "ws://localhost:1080/api/ws/events"
 
+# Cap incoming WebSocket frame size so a misbehaving S4Z can't OOM the app.
+# S4Z's athlete/watching events are <2 KB in practice; 1 MiB is extremely loose.
+S4Z_MAX_FRAME_BYTES: int = 1 << 20
+
 # Reconnect backoff curve — paralleled from DIRCON D-06. Never gives up.
 S4Z_BACKOFF_CURVE: tuple[int, ...] = (1, 2, 5, 10, 15, 30)
 
@@ -47,7 +51,7 @@ async def grade_source(
     request_id = f"zw-alt-req-{random.randint(1, 10**8)}"
     sub_id = f"zw-alt-sub-{random.randint(1, 10**8)}"
 
-    async with websockets.connect(url) as ws:
+    async with websockets.connect(url, max_size=S4Z_MAX_FRAME_BYTES) as ws:
         # EXACT verified payload — do not edit this structure.
         await ws.send(json.dumps({
             "type": "request",

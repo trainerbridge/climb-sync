@@ -51,7 +51,8 @@ async def _smoke_main(
     simulate_outage_at: float | None,
 ) -> int:
     original_source = _sync_loop_module.grade_source_with_reconnect
-    if simulate_outage_at is not None:
+    patched = simulate_outage_at is not None
+    if patched:
         _sync_loop_module.grade_source_with_reconnect = _make_silent_after_source(
             original_source,
             simulate_outage_at,
@@ -133,7 +134,7 @@ async def _smoke_main(
             await asyncio.wait_for(start_task, timeout=5.0)
         except (asyncio.TimeoutError, Exception):
             start_task.cancel()
-        if simulate_outage_at is not None:
+        if patched:
             _sync_loop_module.grade_source_with_reconnect = original_source
 
     print("\n=== Summary ===")

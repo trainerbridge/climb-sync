@@ -14,6 +14,7 @@ collapses the transport-split architecture.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from typing import Any
@@ -31,6 +32,9 @@ from .staleness import StalenessTracker
 
 logger = logging.getLogger(__name__)
 
+MDNS_DISCOVERY_TIMEOUT_SECONDS: float = 10.0
+MDNS_RETRY_BACKOFF: tuple[int, ...] = (2, 5, 10, 15, 30)
+
 
 class SyncLoop:
     """Production grade-sync orchestrator.
@@ -46,7 +50,7 @@ class SyncLoop:
         self._kickr_ip = kickr_ip
         self._s4z_url = s4z_url
 
-        self._grade_queue: asyncio.Queue[tuple[float, float]] = asyncio.Queue()
+        self._grade_queue: asyncio.Queue[tuple[float, float]] = asyncio.Queue(maxsize=1)
         self._staleness = StalenessTracker()
 
         self._raw_grade: float | None = None
@@ -63,13 +67,11 @@ class SyncLoop:
     # --- public API -------------------------------------------------
 
     async def start(self) -> None:
-        """Run the sync loop. Blocks until stop() is called or an unrecoverable error occurs."""
-        if self._kickr_ip is None:
-            logger.info("no kickr_ip provided — discovering via mDNS")
-            self._kickr_ip = await discover_kickr(timeout=10.0)
-            if self._kickr_ip is None:
-                raise RuntimeError("KICKR not found via mDNS; pass kickr_ip explicitly")
+        """Run the sync loop. Blocks until stop() is called or an unrecoverable error occurs.
 
+        mDNS discovery runs inside _run_dircon (with retry) so S4Z connection
+        progress isn't blocked while waiting for the trainer to come online.
+        """
         try:
             async with asyncio.TaskGroup() as tg:
                 self._tg = tg
@@ -79,17 +81,8 @@ class SyncLoop:
             self._tg = None
 
     async def stop(self) -> None:
-        """Graceful shutdown: return Climb to 0% flat, close DIRCON, then signal stop."""
-        # Flat-on-exit pattern (spike 005 lines 269-274)
-        if self._dircon_client is not None and self._connected_dircon:
-            try:
-                await self._dircon_client.set_climb_grade(0.0)
-            except Exception as e:
-                logger.warning("flat-on-exit write failed: %s", e)
-            try:
-                await self._dircon_client.close()
-            except Exception:
-                pass
+        """Graceful shutdown: just signal. _run_dircon's finally owns the
+        flat-write + close so there is no concurrent writer / closer."""
         self._stop_event.set()
 
     @property
@@ -113,6 +106,23 @@ class SyncLoop:
         """
         self._smoothed = None
 
+    def _publish_grade(self, ts: float, grade: float) -> None:
+        """Publish the latest S4Z grade, dropping any stale pending sample."""
+        if self._grade_queue.full():
+            try:
+                self._grade_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        self._grade_queue.put_nowait((ts, grade))
+
+    # --- callbacks (passed to grade_source_with_reconnect) ----------
+
+    def _on_s4z_connect(self) -> None:
+        self._connected_s4z = True
+
+    def _on_s4z_disconnect(self) -> None:
+        self._connected_s4z = False
+
     # --- internal tasks ---------------------------------------------
 
     async def _run_grade_source(self) -> None:
@@ -129,14 +139,13 @@ class SyncLoop:
         even if the underlying source hangs forever waiting for a frame.
         Mirrors the same guard in _run_dircon and _sync_tick_loop.
         """
+        agen = grade_source_with_reconnect(
+            self._s4z_url,
+            on_connect=self._on_s4z_connect,
+            on_disconnect=self._on_s4z_disconnect,
+        ).__aiter__()
+        next_grade: asyncio.Task | None = asyncio.create_task(agen.__anext__())
         try:
-            self._connected_s4z = False
-            agen = grade_source_with_reconnect(
-                self._s4z_url,
-                on_connect=lambda: setattr(self, "_connected_s4z", True),
-                on_disconnect=lambda: setattr(self, "_connected_s4z", False),
-            ).__aiter__()
-            next_grade = asyncio.create_task(agen.__anext__())
             while not self._stop_event.is_set():
                 done, _pending = await asyncio.wait({next_grade}, timeout=1.0)
                 if not done:
@@ -147,10 +156,13 @@ class SyncLoop:
                 try:
                     ts, g = next_grade.result()
                 except StopAsyncIteration:
+                    next_grade = None
                     break
-                finally:
-                    if not self._stop_event.is_set():
-                        next_grade = asyncio.create_task(agen.__anext__())
+
+                # Schedule the next read before processing this sample so the
+                # websocket receive overlaps with our staleness/queue work.
+                if not self._stop_event.is_set():
+                    next_grade = asyncio.create_task(agen.__anext__())
 
                 prev_state = self._staleness.state()
                 if prev_state in ("outage", "never"):
@@ -159,16 +171,59 @@ class SyncLoop:
                     # tick reads _smoothed only between awaits, and we mutate before
                     # awaiting on put().
                     self._smoothed = None
-                self._connected_s4z = True
                 self._raw_grade = g
-                await self._grade_queue.put((ts, g))
-            if not next_grade.done():
-                next_grade.cancel()
+                self._publish_grade(ts, g)
         finally:
+            if next_grade is not None and not next_grade.done():
+                next_grade.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await next_grade
+            with contextlib.suppress(Exception):
+                await agen.aclose()
             self._connected_s4z = False
 
+    async def _resolve_kickr_ip(self) -> str | None:
+        """mDNS discovery with forever-retry until stop_event is set.
+
+        Lives in _run_dircon (not start()) so the S4Z task can run independently
+        while we wait for the trainer to come online.
+        """
+        attempt = 0
+        while not self._stop_event.is_set():
+            logger.info(
+                "mDNS: discovering KICKR (attempt %d, timeout %.0fs)",
+                attempt + 1, MDNS_DISCOVERY_TIMEOUT_SECONDS,
+            )
+            try:
+                ip = await discover_kickr(timeout=MDNS_DISCOVERY_TIMEOUT_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("mDNS discovery raised; will retry")
+                ip = None
+            if ip is not None:
+                return ip
+            delay = MDNS_RETRY_BACKOFF[min(attempt, len(MDNS_RETRY_BACKOFF) - 1)]
+            logger.warning(
+                "mDNS: KICKR not found within %.0fs; retrying in %ds. "
+                "If this persists, use 'Override KICKR IP…' to set the IP manually.",
+                MDNS_DISCOVERY_TIMEOUT_SECONDS, delay,
+            )
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                return None
+            except asyncio.TimeoutError:
+                pass
+            attempt += 1
+        return None
+
     async def _run_dircon(self) -> None:
-        """Connect to KICKR DIRCON, hold, run 1 Hz tick. Reconnect forever on drop."""
+        """Discover (if needed), connect to KICKR DIRCON, run 1 Hz tick. Reconnect forever on drop."""
+        if self._kickr_ip is None:
+            ip = await self._resolve_kickr_ip()
+            if ip is None:
+                return
+            self._kickr_ip = ip
 
         async def connect_and_hold() -> DirconClient:
             client = DirconClient(self._kickr_ip, logger=logger)
@@ -186,9 +241,12 @@ class SyncLoop:
                     connect_and_hold,
                     logger=logger,
                     delays=DIRCON_BACKOFF_CURVE,
+                    stop_event=self._stop_event,
                 )
             except asyncio.CancelledError:
                 raise
+            if client is None:
+                break
 
             self._dircon_client = client
             self._connected_dircon = True
@@ -199,6 +257,13 @@ class SyncLoop:
                 logger.warning("DIRCON dropped: %s; will reconnect", e)
             finally:
                 self._connected_dircon = False
+                # Flat-on-exit only on graceful stop. After connection drop,
+                # the writer is already broken and any send would just raise.
+                if self._stop_event.is_set():
+                    try:
+                        await client.set_climb_grade(0.0)
+                    except Exception as e:
+                        logger.warning("flat-on-exit write failed: %s", e)
                 try:
                     await client.close()
                 except Exception:
@@ -209,31 +274,32 @@ class SyncLoop:
         """1 Hz tick body. Runs until stop or DIRCON drop."""
         last_status_log = time.monotonic()
         while not self._stop_event.is_set():
+            if client.disconnected():
+                raise ConnectionError("DIRCON receive loop ended")
+
             # 1. Drain queue — latest-wins (D-09 no deadband, always write)
-            drained = False
+            latest_grade: float | None = None
             while not self._grade_queue.empty():
                 try:
                     _ts, g = self._grade_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                self._raw_grade = g
+                latest_grade = g
+            if latest_grade is not None:
+                self._raw_grade = latest_grade
                 self._staleness.mark_received()
-                self._smoothed = ema_update(self._smoothed, g)
-                drained = True
+                self._smoothed = ema_update(self._smoothed, latest_grade)
 
             # 2. Log staleness transitions (once per period)
-            state = self._staleness.state()
-            if state == "warn" and not self._staleness._logged_warn:
+            if self._staleness.take_warn_log():
                 logger.warning(
                     "grade.stale: S4Z quiet for >%.0fs", STALE_WARN_SECONDS
                 )
-                self._staleness._logged_warn = True
-            elif state == "outage" and not self._staleness._logged_outage:
+            elif self._staleness.take_outage_log():
                 logger.error(
                     "grade.outage: S4Z silent for >%.0fs; holding last smoothed value on Climb",
                     STALE_OUTAGE_SECONDS,
                 )
-                self._staleness._logged_outage = True
                 # D-12: hold last value on Climb — do NOT clear _smoothed here.
                 # EMA re-seed on actual S4Z recovery is handled in _run_grade_source
                 # (Pitfall 4: re-seed on first post-outage sample, not on silence threshold).
@@ -241,11 +307,8 @@ class SyncLoop:
             # 3. Write current smoothed — D-12: hold last value indefinitely
             if self._smoothed is not None:
                 clamped = clamp_grade(self._smoothed)
-                try:
-                    await client.set_climb_grade(clamped)
-                except (ConnectionError, OSError, asyncio.TimeoutError):
-                    # Re-raise up to _run_dircon which will reconnect
-                    raise
+                # Re-raise transport errors up to _run_dircon for reconnect.
+                await client.set_climb_grade(clamped)
 
             # 4. Optional periodic status line (every 30s like spike 005)
             now = time.monotonic()
@@ -259,4 +322,10 @@ class SyncLoop:
                 )
                 last_status_log = now
 
-            await asyncio.sleep(WRITE_INTERVAL_SECONDS)
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=WRITE_INTERVAL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass

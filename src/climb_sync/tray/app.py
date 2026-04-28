@@ -66,14 +66,10 @@ def _status_block_lines(status: dict) -> list[str]:
     ]
 
 
-def _status_line(sync_loop, index: int) -> str:
-    """Dynamic pystray menu label for the latest SyncLoop status."""
-    return _status_block_lines(sync_loop.status)[index]
-
-
 def build_tray_icon(
     *,
-    sync_loop,
+    sync_loop=None,
+    get_sync_loop: Callable[[], Any] | None = None,
     on_restart_sync: Callable[[], None],
     on_override_ip: Callable[[], None],
     on_exit: Callable[[], None],
@@ -81,6 +77,14 @@ def build_tray_icon(
 ) -> Any:
     """Construct the pystray.Icon with the D-02 menu and start the poller."""
     import pystray
+
+    if get_sync_loop is None:
+        if sync_loop is None:
+            raise ValueError("build_tray_icon requires sync_loop or get_sync_loop")
+        get_sync_loop = lambda: sync_loop
+
+    def _current_status() -> dict:
+        return get_sync_loop().status
 
     images = {
         "green": generate_icon("green"),
@@ -97,10 +101,10 @@ def build_tray_icon(
 
     def _build_menu():
         items: list[Any] = []
-        for index in range(len(_status_block_lines(sync_loop.status))):
+        for index in range(len(_status_block_lines(_current_status()))):
             items.append(
                 pystray.MenuItem(
-                    lambda _item, i=index: _status_line(sync_loop, i),
+                    lambda _item, i=index: _status_block_lines(_current_status())[i],
                     None,
                     enabled=False,
                 )
@@ -111,7 +115,7 @@ def build_tray_icon(
         items.append(pystray.MenuItem("Exit", lambda icon, item: _exit_handler(icon)))
         return pystray.Menu(*items)
 
-    initial_status = sync_loop.status
+    initial_status = _current_status()
     initial_color = _icon_color_for(initial_status)
     icon = pystray.Icon(
         name="climb-sync",
@@ -125,15 +129,25 @@ def build_tray_icon(
 
     def _poll_status() -> None:
         last_color = initial_color
+        last_menu_signature: tuple[str, ...] | None = None
+        last_title: str | None = None
         while not stop_event.wait(poll_interval_seconds):
             try:
-                status = sync_loop.status
+                status = _current_status()
                 color = _icon_color_for(status)
                 if color != last_color:
                     icon.icon = images[color]
                     last_color = color
-                icon.title = _tooltip_for(status)
-                icon.update_menu()
+                title = _tooltip_for(status)
+                if title != last_title:
+                    icon.title = title
+                    last_title = title
+                # Only re-render the menu when the status block actually
+                # changed; saves a per-second pystray round-trip.
+                signature = tuple(_status_block_lines(status))
+                if signature != last_menu_signature:
+                    icon.update_menu()
+                    last_menu_signature = signature
             except Exception:
                 logger.exception("status poller iteration failed")
 

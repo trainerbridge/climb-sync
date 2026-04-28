@@ -10,10 +10,10 @@ import sys
 from ..config import log_dir
 
 
-def setup_logging(verbose: bool = False) -> None:
+def setup_logging(verbose: bool = False, level: str = "INFO") -> None:
     """One-shot dictConfig for the app entry point."""
     log_path = log_dir() / "app.log"
-    level = "DEBUG" if verbose else "INFO"
+    level = "DEBUG" if verbose else level.upper()
 
     handlers: dict = {
         "file": {

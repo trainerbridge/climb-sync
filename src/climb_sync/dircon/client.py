@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 DIRCON_DEFAULT_PORT = 36866
 # D-06 locked: forever-retry curve, capped at 30s
 DIRCON_BACKOFF_CURVE: tuple[int, ...] = (1, 2, 5, 10, 15, 30)
+MAX_DIRCON_PAYLOAD_BYTES = 65535
+MAX_DIRCON_BUFFER_BYTES = 6 + MAX_DIRCON_PAYLOAD_BYTES
 
 
 class DirconClient:
@@ -38,6 +40,10 @@ class DirconClient:
         self.notifications: asyncio.Queue = asyncio.Queue()
         self._recv_task: asyncio.Task | None = None
         self._closed = False
+        # Serialize bytes-on-wire so concurrent writes (tick-loop + flat-on-exit
+        # from stop()) don't interleave frames or race the order the trainer
+        # sees them in. Lazy-binds to the running loop on first acquire.
+        self._write_lock: asyncio.Lock = asyncio.Lock()
         self._log = logger or logging.getLogger(__name__)
 
     async def connect(self) -> None:
@@ -46,6 +52,8 @@ class DirconClient:
         self._recv_task = asyncio.create_task(self._recv_loop(), name="dircon-recv")
 
     async def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
         if self._recv_task is not None:
             self._recv_task.cancel()
@@ -67,25 +75,44 @@ class DirconClient:
                 fut.set_exception(ConnectionError("DirconClient closed"))
         self._awaiting.clear()
 
+    def disconnected(self) -> bool:
+        """Return True when the receive loop has ended unexpectedly."""
+        return (
+            self._recv_task is not None
+            and self._recv_task.done()
+            and not self._closed
+        )
+
     async def _recv_loop(self) -> None:
-        buf = b""
+        # bytearray + del-slices to avoid the O(n^2) reallocation of `bytes += chunk`.
+        buf = bytearray()
         try:
             while not self._closed:
+                if self._reader is None:
+                    raise ConnectionError("DirconClient is not connected")
                 chunk = await self._reader.read(4096)
                 if not chunk:
                     raise ConnectionResetError("DIRCON peer closed the TCP connection")
-                buf += chunk
+                buf.extend(chunk)
+                if len(buf) > MAX_DIRCON_BUFFER_BYTES:
+                    raise ConnectionError(
+                        f"DIRCON frame buffer exceeded {MAX_DIRCON_BUFFER_BYTES} bytes"
+                    )
                 while len(buf) >= 6:
-                    hdr = decode_header(buf[:6])
+                    hdr = decode_header(bytes(buf[:6]))
                     if hdr is None or hdr[0] != 0x01:
                         # resync: drop one byte (preserved from spike 004 lines 199-203)
-                        buf = buf[1:]
+                        del buf[:1]
                         continue
                     _, opcode, seq, length = hdr
+                    if length > MAX_DIRCON_PAYLOAD_BYTES:
+                        raise ConnectionError(
+                            f"DIRCON payload length too large: {length}"
+                        )
                     if len(buf) < 6 + length:
                         break
-                    payload = buf[6:6 + length]
-                    buf = buf[6 + length:]
+                    payload = bytes(buf[6:6 + length])
+                    del buf[:6 + length]
                     if opcode == OP_NOTIFY:
                         await self.notifications.put((time.monotonic(), payload))
                     else:
@@ -96,7 +123,9 @@ class DirconClient:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._log.warning("DIRCON recv loop ending: %s", e)
+            self._log.warning(
+                "DIRCON recv loop ending: %s (%s)", e, OPCODE_NAMES.get(0, "")
+            )
             for fut in self._awaiting.values():
                 if not fut.done():
                     fut.set_exception(e)
@@ -105,13 +134,24 @@ class DirconClient:
             await self.notifications.put(("__disconnected__", e))
 
     async def _send_and_wait(self, opcode: int, payload: bytes, *, timeout: float = 3.0) -> tuple[int, bytes]:
-        seq = (self._seq + 1) & 0xFFFF
-        self._seq = seq
+        if self._writer is None or self._writer.is_closing():
+            raise ConnectionError("DirconClient is not connected")
         fut = asyncio.get_running_loop().create_future()
-        self._awaiting[seq] = fut
-        frame = encode_frame(opcode, seq, payload)
-        self._writer.write(frame)
-        await self._writer.drain()
+        # Hold the write lock only across seq-allocation + write+drain so
+        # bytes-on-wire are serialized; allow the response wait to overlap.
+        async with self._write_lock:
+            if self._writer is None or self._writer.is_closing():
+                raise ConnectionError("DirconClient is not connected")
+            seq = (self._seq + 1) & 0xFFFF
+            self._seq = seq
+            self._awaiting[seq] = fut
+            frame = encode_frame(opcode, seq, payload)
+            self._writer.write(frame)
+            try:
+                await self._writer.drain()
+            except Exception:
+                self._awaiting.pop(seq, None)
+                raise
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -166,16 +206,17 @@ async def with_reconnect(
     connect_fn: Callable[[], Awaitable],
     *,
     logger: logging.Logger,
+    stop_event: asyncio.Event,
     delays: tuple[int | float, ...] = DIRCON_BACKOFF_CURVE,
 ):
     """Retry connect_fn forever with the given backoff curve (D-06: never gives up).
 
-    Returns the result of connect_fn on first success.
-    Curve is clamped at the last element, so a curve of (1, 2, 5, 10, 15, 30)
-    caps at 30s no matter how many attempts.
+    Returns the result of connect_fn on first success, or None when stop_event
+    is set during backoff. Curve is clamped at the last element, so a curve of
+    (1, 2, 5, 10, 15, 30) caps at 30s no matter how many attempts.
     """
     attempt = 0
-    while True:
+    while not stop_event.is_set():
         try:
             return await connect_fn()
         except Exception as e:
@@ -184,5 +225,10 @@ async def with_reconnect(
                 "connect attempt %d failed (%s); retrying in %ss",
                 attempt + 1, e, delay,
             )
-            await asyncio.sleep(delay)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                return None
+            except asyncio.TimeoutError:
+                pass
             attempt += 1
+    return None

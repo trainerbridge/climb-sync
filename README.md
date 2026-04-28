@@ -46,6 +46,7 @@ If mDNS auto-discovery doesn't find your Kickr, right-click the tray icon →
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
+pip install -e .
 python -m climb_sync
 ```
 

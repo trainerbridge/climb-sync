@@ -39,6 +39,7 @@ class AppShell:
         self._tray_icon_factory = tray_icon_factory
 
         self._asyncio_loop: asyncio.AbstractEventLoop | None = None
+        self._asyncio_loop_ready = threading.Event()
         self._asyncio_thread: threading.Thread | None = None
         self._sync_start_future: asyncio.Future | None = None
 
@@ -60,10 +61,15 @@ class AppShell:
         )
         self._asyncio_thread.start()
 
-        for _ in range(50):
-            if self._asyncio_loop is not None:
-                break
-            threading.Event().wait(0.02)
+        # Block until the asyncio thread has installed its event loop, so the
+        # tray-thread's restart_sync()/exit_app() bridges always have a loop
+        # to call_soon_threadsafe into. 5 seconds is generous; cold launch with
+        # AV scanning has been observed at ~1s in field reports.
+        if not self._asyncio_loop_ready.wait(timeout=5.0):
+            logger.error(
+                "asyncio thread did not signal loop-ready within 5s; "
+                "tray bridges may no-op until the loop comes up"
+            )
 
         self._pystray_thread = threading.Thread(
             target=self._pystray_target,
@@ -86,10 +92,17 @@ class AppShell:
         """Schedule SyncLoop restart on the asyncio thread."""
         if self._asyncio_loop is None:
             return
-        asyncio.run_coroutine_threadsafe(
+        future = asyncio.run_coroutine_threadsafe(
             self._restart_sync_async(),
             self._asyncio_loop,
         )
+        future.add_done_callback(self._log_restart_result)
+
+    def _log_restart_result(self, future) -> None:
+        try:
+            future.result()
+        except Exception:
+            logger.exception("restart_sync failed")
 
     async def _restart_sync_async(self) -> None:
         """Stop fully before constructing a new SyncLoop."""
@@ -117,7 +130,11 @@ class AppShell:
         new_ip = ask_kickr_ip(self._tk_root, current=self.config.kickr_ip)
         if new_ip is None:
             return
-        save_config(self.config.replace(kickr_ip=new_ip))
+        try:
+            save_config(self.config.replace(kickr_ip=new_ip))
+        except ValueError:
+            logger.warning("ip-override: %r rejected as invalid; not applied", new_ip)
+            return
         self.config = load_config()
         if self.config.kickr_ip != new_ip:
             logger.warning("ip-override: %r rejected as invalid; not applied", new_ip)
@@ -135,9 +152,14 @@ class AppShell:
 
     def _asyncio_target(self) -> None:
         """Run a fresh asyncio loop in this thread."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._asyncio_loop = loop
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._asyncio_loop = loop
+        finally:
+            # Always release the main-thread waiter so run() doesn't block
+            # forever if loop construction itself failed.
+            self._asyncio_loop_ready.set()
 
         async def driver() -> None:
             self._sync_start_future = asyncio.ensure_future(self.sync_loop.start())
@@ -166,7 +188,7 @@ class AppShell:
             return
         try:
             self._pystray_icon = self._tray_icon_factory(
-                sync_loop=self.sync_loop,
+                get_sync_loop=lambda: self.sync_loop,
                 on_restart_sync=self.restart_sync,
                 on_override_ip=self.show_override_ip_dialog,
                 on_exit=self.exit_app,
@@ -179,6 +201,7 @@ class AppShell:
 
     def _shutdown(self) -> None:
         """Best-effort cleanup; shutdown paths must not raise."""
+        stopped_cleanly = False
         if self._asyncio_loop is not None:
             try:
                 fut = asyncio.run_coroutine_threadsafe(
@@ -186,18 +209,34 @@ class AppShell:
                     self._asyncio_loop,
                 )
                 fut.result(timeout=5.0)
+                stopped_cleanly = True
             except Exception:
                 logger.exception("sync_loop.stop() failed during shutdown")
-            try:
-                self._asyncio_loop.call_soon_threadsafe(self._asyncio_loop.stop)
-            except Exception:
-                pass
 
         if self._asyncio_thread is not None:
             try:
                 self._asyncio_thread.join(timeout=5.0)
             except Exception:
                 pass
+            if self._asyncio_thread.is_alive() and self._asyncio_loop is not None:
+                logger.warning("asyncio thread did not stop cleanly; forcing loop stop")
+                if self._sync_start_future is not None:
+                    try:
+                        self._asyncio_loop.call_soon_threadsafe(
+                            self._sync_start_future.cancel
+                        )
+                    except Exception:
+                        pass
+                try:
+                    self._asyncio_loop.call_soon_threadsafe(self._asyncio_loop.stop)
+                except Exception:
+                    pass
+                try:
+                    self._asyncio_thread.join(timeout=2.0)
+                except Exception:
+                    pass
+            elif not stopped_cleanly:
+                logger.warning("asyncio thread stopped after an unclean stop request")
 
         self._pystray_stop_event.set()
         if self._pystray_icon is not None:

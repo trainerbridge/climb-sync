@@ -25,5 +25,6 @@ STALE_OUTAGE_SECONDS: float = 30.0
 # DIRCON reconnect backoff — D-06 locked (re-exported here for convenience)
 DIRCON_BACKOFF_CURVE: tuple[int, ...] = (1, 2, 5, 10, 15, 30)
 
-# S4Z WebSocket reconnect backoff — parallels D-06 curve
-S4Z_BACKOFF_CURVE: tuple[int, ...] = (1, 2, 5, 10, 15, 30)
+# S4Z_BACKOFF_CURVE lives in grade.source (single source of truth);
+# sync/__init__.py re-exports it for callers who already import from
+# climb_sync.sync.

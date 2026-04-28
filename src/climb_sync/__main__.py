@@ -7,7 +7,7 @@ import logging
 import sys
 
 from climb_sync.app import AppShell
-from climb_sync.config import load_config, lock_path
+from climb_sync.config import is_valid_ipv4, load_config, lock_path
 from climb_sync.lifecycle.logging_setup import setup_logging
 from climb_sync.lifecycle.single_instance import AlreadyRunning, SingleInstanceLock
 
@@ -58,7 +58,11 @@ def main() -> int:
     parser.add_argument("--ip", type=str, default=None, help="KICKR IP (skip mDNS).")
     args = parser.parse_args()
 
-    setup_logging(verbose=args.verbose)
+    if args.ip and not is_valid_ipv4(args.ip):
+        parser.error("--ip must be an IPv4 address, for example 192.168.26.65")
+
+    config = load_config()
+    setup_logging(verbose=args.verbose, level=config.log_level)
 
     if args.smoke:
         from climb_sync.smoke import run_smoke
@@ -78,7 +82,6 @@ def main() -> int:
         return 1
 
     try:
-        config = load_config()
         if args.ip:
             # Dev/operator-only override from a trusted shell; config file input
             # remains validated through load_config().

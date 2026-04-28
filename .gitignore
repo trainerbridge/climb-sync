@@ -13,3 +13,5 @@ venv/
 
 # Test/cache
 .pytest_cache/
+.tmp/
+pytest-cache-files-*/

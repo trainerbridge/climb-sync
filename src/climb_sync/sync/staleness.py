@@ -25,14 +25,14 @@ class StalenessTracker:
 
     def __init__(self) -> None:
         self._last_update_ts: float | None = None
-        self._logged_warn: bool = False
-        self._logged_outage: bool = False
+        self._warn_pending: bool = True
+        self._outage_pending: bool = True
 
     def mark_received(self) -> None:
-        """Call on every grade received from S4Z. Resets warn/outage-once flags."""
+        """Call on every grade received from S4Z. Re-arms warn/outage log gates."""
         self._last_update_ts = time.monotonic()
-        self._logged_warn = False
-        self._logged_outage = False
+        self._warn_pending = True
+        self._outage_pending = True
 
     def state(self, now: float | None = None) -> str:
         """Returns 'fresh' | 'warn' | 'outage' | 'never'."""
@@ -49,3 +49,17 @@ class StalenessTracker:
         if self._last_update_ts is None:
             return None
         return (now if now is not None else time.monotonic()) - self._last_update_ts
+
+    def take_warn_log(self) -> bool:
+        """Returns True at most once per outage episode while state is 'warn'."""
+        if self._warn_pending and self.state() == "warn":
+            self._warn_pending = False
+            return True
+        return False
+
+    def take_outage_log(self) -> bool:
+        """Returns True at most once per outage episode while state is 'outage'."""
+        if self._outage_pending and self.state() == "outage":
+            self._outage_pending = False
+            return True
+        return False
