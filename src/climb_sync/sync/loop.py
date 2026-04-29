@@ -26,6 +26,7 @@ from .constants import (
     DIRCON_BACKOFF_CURVE,
     STALE_WARN_SECONDS,
     STALE_OUTAGE_SECONDS,
+    LONG_OUTAGE_PARK_SECONDS,
 )
 from .smoothing import ema_update, clamp_grade
 from .staleness import StalenessTracker
@@ -59,6 +60,9 @@ class SyncLoop:
         self._connected_dircon: bool = False
         self._connected_s4z: bool = False
         self._attempt_count: int = 0
+        # Set after a one-shot 0% write past LONG_OUTAGE_PARK_SECONDS of S4Z
+        # silence; cleared on the first post-outage sample so writes resume.
+        self._long_outage_parked: bool = False
 
         self._tg: asyncio.TaskGroup | None = None
         self._stop_event = asyncio.Event()
@@ -171,6 +175,8 @@ class SyncLoop:
                     # tick reads _smoothed only between awaits, and we mutate before
                     # awaiting on put().
                     self._smoothed = None
+                    # Resume writes if we'd parked the Climb during a long outage.
+                    self._long_outage_parked = False
                 self._raw_grade = g
                 self._publish_grade(ts, g)
         finally:
@@ -304,8 +310,24 @@ class SyncLoop:
                 # EMA re-seed on actual S4Z recovery is handled in _run_grade_source
                 # (Pitfall 4: re-seed on first post-outage sample, not on silence threshold).
 
-            # 3. Write current smoothed — D-12: hold last value indefinitely
-            if self._smoothed is not None:
+            # 3. Write current smoothed — D-12 holds last value through outage,
+            # but if S4Z stays silent past LONG_OUTAGE_PARK_SECONDS we park the
+            # Climb at 0% with one final write and suppress further writes
+            # until S4Z resumes (handled by the recovery branch in
+            # _run_grade_source, which clears _long_outage_parked).
+            age = self._staleness.age_seconds()
+            if age is not None and age >= LONG_OUTAGE_PARK_SECONDS:
+                if not self._long_outage_parked:
+                    # Re-raise transport errors up to _run_dircon for reconnect;
+                    # we set the flag only after the write succeeds so a failed
+                    # park-write retries on the next reconnect tick.
+                    await client.set_climb_grade(0.0)
+                    self._long_outage_parked = True
+                    logger.warning(
+                        "grade.long_outage_park: S4Z silent for >%.0fs; parked Climb at 0%% and pausing writes until S4Z resumes",
+                        LONG_OUTAGE_PARK_SECONDS,
+                    )
+            elif self._smoothed is not None:
                 clamped = clamp_grade(self._smoothed)
                 # Re-raise transport errors up to _run_dircon for reconnect.
                 await client.set_climb_grade(clamped)

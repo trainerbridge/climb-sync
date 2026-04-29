@@ -22,6 +22,12 @@ GRADE_MAX_FRACTION: float = 0.20        # +20%
 STALE_WARN_SECONDS: float = 5.0
 STALE_OUTAGE_SECONDS: float = 30.0
 
+# Long-outage park threshold: after this many seconds of no S4Z grade, write 0%
+# once and pause further writes until S4Z resumes. Refines D-12 (which held the
+# last grade indefinitely) so the Climb doesn't stay tilted for hours after
+# Zwift/Sauce4Zwift exit. Reset to writing on the first post-outage sample.
+LONG_OUTAGE_PARK_SECONDS: float = 300.0
+
 # DIRCON reconnect backoff — D-06 locked (re-exported here for convenience)
 DIRCON_BACKOFF_CURVE: tuple[int, ...] = (1, 2, 5, 10, 15, 30)
 
