@@ -35,18 +35,22 @@ async def grade_source(
     url: str = S4Z_URL,
     *,
     on_connect: Callable[[], None] | None = None,
-) -> AsyncIterator[tuple[float, float]]:
-    """Async generator yielding (monotonic_ts, grade_fraction) tuples.
+) -> AsyncIterator[tuple[float, float, int | None]]:
+    """Async generator yielding (monotonic_ts, grade_fraction, workout_zone) tuples.
 
     The subscribe payload matches SauceLLC's verified format exactly:
         {"type": "request", "uid": <str>,
          "data": {"method": "subscribe",
                   "arg": {"event": "athlete/watching", "subId": <str>}}}
 
-    Yields (time.monotonic(), float(grade)) for every athlete/watching event
-    carrying a state.grade field. Skips messages without grade (Pitfall 2).
-    Raises RuntimeError on subscribe-failure. ConnectionClosed / OSError
-    propagate to the caller — use grade_source_with_reconnect() for forever-retry.
+    Yields (time.monotonic(), float(grade), workout_zone) for every
+    athlete/watching event carrying a state.grade field. workout_zone is the
+    int zone index (1-15) when in a structured workout, or None for free ride.
+    S4Z derives it from `_progress & 0xF || null`, so `null`/zero collapses to
+    None — see SauceLLC/sauce4zwift src/zwift.mjs processPlayerStateMessage.
+    Skips messages without grade (Pitfall 2). Raises RuntimeError on
+    subscribe-failure. ConnectionClosed / OSError propagate to the caller — use
+    grade_source_with_reconnect() for forever-retry.
     """
     request_id = f"zw-alt-req-{random.randint(1, 10**8)}"
     sub_id = f"zw-alt-sub-{random.randint(1, 10**8)}"
@@ -89,8 +93,16 @@ async def grade_source(
             grade = state.get("grade")
             if grade is None:
                 continue  # defensive: no grade field (Pitfall 2)
+            raw_zone = state.get("workoutZone")
+            if raw_zone is None:
+                workout_zone: int | None = None
+            else:
+                try:
+                    workout_zone = int(raw_zone)
+                except (TypeError, ValueError):
+                    workout_zone = None
             try:
-                yield (time.monotonic(), float(grade))
+                yield (time.monotonic(), float(grade), workout_zone)
             except (TypeError, ValueError):
                 continue  # malformed grade value
 
@@ -101,7 +113,7 @@ async def grade_source_with_reconnect(
     delays: tuple[int, ...] = S4Z_BACKOFF_CURVE,
     on_connect: Callable[[], None] | None = None,
     on_disconnect: Callable[[], None] | None = None,
-) -> AsyncIterator[tuple[float, float]]:
+) -> AsyncIterator[tuple[float, float, int | None]]:
     """Forever-retry wrapper around grade_source().
 
     On expected network errors (ConnectionClosed, ConnectionRefusedError,
@@ -115,8 +127,8 @@ async def grade_source_with_reconnect(
     attempt = 0
     while True:
         try:
-            async for ts_grade in grade_source(url, on_connect=on_connect):
-                yield ts_grade
+            async for ts_grade_zone in grade_source(url, on_connect=on_connect):
+                yield ts_grade_zone
             # Generator exited cleanly — S4Z closed the stream.
             attempt = 0
             logger.warning("S4Z stream ended cleanly; reconnecting")

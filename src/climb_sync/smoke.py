@@ -19,14 +19,14 @@ logger = logging.getLogger(__name__)
 
 
 def _make_silent_after_source(
-    real_factory: Callable[..., AsyncIterator[tuple[float, float]]],
+    real_factory: Callable[..., AsyncIterator[tuple[float, float, int | None]]],
     silent_after_seconds: float,
-) -> Callable[..., AsyncIterator[tuple[float, float]]]:
+) -> Callable[..., AsyncIterator[tuple[float, float, int | None]]]:
     """Wrap grade_source_with_reconnect so it goes silent after N seconds."""
 
-    async def silent_after(*args: Any, **kwargs: Any) -> AsyncIterator[tuple[float, float]]:
+    async def silent_after(*args: Any, **kwargs: Any) -> AsyncIterator[tuple[float, float, int | None]]:
         deadline: float | None = None
-        async for ts, g in real_factory(*args, **kwargs):
+        async for ts, g, z in real_factory(*args, **kwargs):
             if deadline is None:
                 deadline = time.monotonic() + silent_after_seconds
                 logger.info(
@@ -39,7 +39,7 @@ def _make_silent_after_source(
                 )
                 forever = asyncio.Event()
                 await forever.wait()
-            yield ts, g
+            yield ts, g, z
 
     return silent_after
 

@@ -27,6 +27,7 @@ from .constants import (
     STALE_WARN_SECONDS,
     STALE_OUTAGE_SECONDS,
     LONG_OUTAGE_PARK_SECONDS,
+    WORKOUT_DEBOUNCE_SAMPLES,
 )
 from .smoothing import ema_update, clamp_grade
 from .staleness import StalenessTracker
@@ -63,6 +64,18 @@ class SyncLoop:
         # Set after a one-shot 0% write past LONG_OUTAGE_PARK_SECONDS of S4Z
         # silence; cleared on the first post-outage sample so writes resume.
         self._long_outage_parked: bool = False
+        # ERG/SIM detection. _mode is "unknown" at startup (don't write — we
+        # don't know yet whether Zwift is driving the Climb), "free_ride" when
+        # Zwift is writing grade itself (we MUST stay silent or fight Zwift),
+        # or "workout" when Zwift goes silent during ERG and we take over.
+        # Inferred from S4Z `state.workoutZone` with N-sample debounce to ride
+        # through single-frame flicker at zone transitions.
+        self._mode: str = "unknown"
+        self._workout_zone: int | None = None
+        self._zone_history: list[int | None] = []
+        # One-shot 0% write on transition to free_ride; cleared on transition
+        # back to workout so writes resume cleanly.
+        self._free_ride_parked: bool = False
 
         self._tg: asyncio.TaskGroup | None = None
         self._stop_event = asyncio.Event()
@@ -99,6 +112,8 @@ class SyncLoop:
             "last_smoothed": self._smoothed,
             "staleness": self._staleness.state(),
             "attempt_count": self._attempt_count,
+            "mode": self._mode,
+            "workout_zone": self._workout_zone,
         }
 
     def mark_s4z_reconnect(self) -> None:
@@ -109,6 +124,48 @@ class SyncLoop:
         resumption would have the EMA slowly converge from a stale pre-outage value.
         """
         self._smoothed = None
+
+    def _update_mode(self, zone: int | None) -> None:
+        """Debounce S4Z workoutZone into a confirmed mode transition.
+
+        Appends the latest zone observation, keeps only the last
+        WORKOUT_DEBOUNCE_SAMPLES, and flips _mode only when all samples agree.
+        On transition INTO workout: clears _smoothed (re-seed EMA) and the
+        long-outage park flag, and clears the free-ride park flag so the next
+        tick can write. On transition INTO free_ride: clears the free-ride
+        park flag so the tick loop performs a single 0% write to neutralise
+        the Climb before going silent.
+        """
+        history = self._zone_history
+        history.append(zone)
+        if len(history) > WORKOUT_DEBOUNCE_SAMPLES:
+            del history[: len(history) - WORKOUT_DEBOUNCE_SAMPLES]
+        if len(history) < WORKOUT_DEBOUNCE_SAMPLES:
+            return
+        if all(z is not None for z in history):
+            new_mode = "workout"
+        elif all(z is None for z in history):
+            new_mode = "free_ride"
+        else:
+            return  # mixed window — keep current mode until it settles
+        if new_mode == self._mode:
+            return
+        prev_mode = self._mode
+        self._mode = new_mode
+        if new_mode == "workout":
+            self._smoothed = None
+            self._long_outage_parked = False
+            self._free_ride_parked = False
+            logger.info(
+                "mode: workout (zone=%s); resuming Climb writes (Zwift in ERG)",
+                zone,
+            )
+        else:  # free_ride
+            self._free_ride_parked = False  # tick loop will park once
+            logger.info(
+                "mode: free_ride (prev=%s); pausing Climb writes (Zwift drives Climb directly)",
+                prev_mode,
+            )
 
     def _publish_grade(self, ts: float, grade: float) -> None:
         """Publish the latest S4Z grade, dropping any stale pending sample."""
@@ -158,7 +215,7 @@ class SyncLoop:
                     continue
 
                 try:
-                    ts, g = next_grade.result()
+                    ts, g, z = next_grade.result()
                 except StopAsyncIteration:
                     next_grade = None
                     break
@@ -178,6 +235,8 @@ class SyncLoop:
                     # Resume writes if we'd parked the Climb during a long outage.
                     self._long_outage_parked = False
                 self._raw_grade = g
+                self._workout_zone = z
+                self._update_mode(z)
                 self._publish_grade(ts, g)
         finally:
             if next_grade is not None and not next_grade.done():
@@ -310,24 +369,32 @@ class SyncLoop:
                 # EMA re-seed on actual S4Z recovery is handled in _run_grade_source
                 # (Pitfall 4: re-seed on first post-outage sample, not on silence threshold).
 
-            # 3. Write current smoothed — D-12 holds last value through outage,
-            # but if S4Z stays silent past LONG_OUTAGE_PARK_SECONDS we park the
-            # Climb at 0% with one final write and suppress further writes
-            # until S4Z resumes (handled by the recovery branch in
-            # _run_grade_source, which clears _long_outage_parked).
+            # 3. Write current smoothed, gated by mode + outage state.
+            # Priority: long-outage park > free-ride suppression > workout write.
+            # In free_ride / unknown we never write past the one-shot 0% park —
+            # Zwift owns the Climb in those modes and a competing write would
+            # fight Zwift's own grade writes over BLE.
             age = self._staleness.age_seconds()
             if age is not None and age >= LONG_OUTAGE_PARK_SECONDS:
-                if not self._long_outage_parked:
-                    # Re-raise transport errors up to _run_dircon for reconnect;
-                    # we set the flag only after the write succeeds so a failed
-                    # park-write retries on the next reconnect tick.
+                if self._mode == "workout" and not self._long_outage_parked:
+                    # Only park if we'd actually been writing. In free_ride
+                    # mode the Climb is already Zwift-owned, no park needed.
                     await client.set_climb_grade(0.0)
                     self._long_outage_parked = True
                     logger.warning(
                         "grade.long_outage_park: S4Z silent for >%.0fs; parked Climb at 0%% and pausing writes until S4Z resumes",
                         LONG_OUTAGE_PARK_SECONDS,
                     )
-            elif self._smoothed is not None:
+            elif self._mode == "free_ride":
+                if not self._free_ride_parked:
+                    # One-shot 0% to neutralise the Climb on transition out of
+                    # ERG; Zwift takes over driving grade after this write.
+                    await client.set_climb_grade(0.0)
+                    self._free_ride_parked = True
+                    logger.info(
+                        "free_ride: parked Climb at 0%% (one-shot); Zwift now drives Climb",
+                    )
+            elif self._mode == "workout" and self._smoothed is not None:
                 clamped = clamp_grade(self._smoothed)
                 # Re-raise transport errors up to _run_dircon for reconnect.
                 await client.set_climb_grade(clamped)
